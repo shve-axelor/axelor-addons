@@ -78,7 +78,7 @@ public class RedmineProjectServiceImpl implements RedmineProjectService {
         batchRepo
             .all()
             .filter(
-                "self.id != ?1 and self.redmineBatch.id = ?2",
+                "self.id != ?1 and self.redmineBatch.id = ?2 and (self.anomaly = 0 or self.anomaly < self.done)",
                 batch.getId(),
                 batch.getRedmineBatch().getId())
             .order("-updatedOn")
