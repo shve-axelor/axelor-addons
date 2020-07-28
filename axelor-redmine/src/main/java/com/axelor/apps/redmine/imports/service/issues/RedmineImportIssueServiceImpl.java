@@ -21,9 +21,11 @@ import com.axelor.apps.base.db.AppRedmine;
 import com.axelor.apps.base.db.Batch;
 import com.axelor.apps.base.db.Product;
 import com.axelor.apps.base.db.repo.AppRedmineRepository;
+import com.axelor.apps.base.db.repo.BatchRepository;
 import com.axelor.apps.base.db.repo.CompanyRepository;
 import com.axelor.apps.base.db.repo.PartnerRepository;
 import com.axelor.apps.base.db.repo.ProductRepository;
+import com.axelor.apps.base.job.UncheckedJobExecutionException;
 import com.axelor.apps.base.service.administration.AbstractBatch;
 import com.axelor.apps.project.db.Project;
 import com.axelor.apps.project.db.TeamTaskCategory;
@@ -39,6 +41,7 @@ import com.axelor.auth.db.repo.UserRepository;
 import com.axelor.db.JPA;
 import com.axelor.exception.service.TraceBackService;
 import com.axelor.i18n.I18n;
+import com.axelor.inject.Beans;
 import com.axelor.meta.MetaStore;
 import com.axelor.meta.schema.views.Selection.Option;
 import com.axelor.team.db.TeamTask;
@@ -46,7 +49,8 @@ import com.axelor.team.db.repo.TeamTaskRepository;
 import com.google.common.collect.ObjectArrays;
 import com.google.inject.Inject;
 import com.google.inject.persist.Transactional;
-import com.taskadapter.redmineapi.bean.CustomField;
+import com.google.inject.servlet.RequestScoper;
+import com.google.inject.servlet.ServletScopes;
 import com.taskadapter.redmineapi.bean.Issue;
 import com.taskadapter.redmineapi.bean.Version;
 import java.math.BigDecimal;
@@ -54,6 +58,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -62,6 +67,7 @@ import java.util.Map;
 import java.util.ResourceBundle;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -166,7 +172,9 @@ public class RedmineImportIssueServiceImpl extends RedmineImportService
 
       LOG.debug("Total issues to import: {}", redmineIssueList.size());
 
-      this.importIssuesFromList(redmineIssueList, redmineBatch);
+      // IMPORT PROCESS IN SEPARATE THREAD
+
+      this.executeImportInThread(redmineIssueList, redmineBatch);
 
       // SET ISSUES PARENTS
       this.setParentTasks();
@@ -211,14 +219,13 @@ public class RedmineImportIssueServiceImpl extends RedmineImportService
       errors = new Object[] {};
       String failedRedmineIssuesIds = redmineBatch.getFailedRedmineIssuesIds();
 
+      setRedmineCustomFieldsMap(redmineIssue.getCustomFields());
+
       // ERROR AND DON'T IMPORT IF PRODUCT IS SELECTED IN REDMINE AND NOT FOUND IN OS
 
-      CustomField redmineProduct = redmineIssue.getCustomFieldByName(redmineIssueProduct);
       String value =
-          redmineProduct != null
-                  && redmineProduct.getValue() != null
-                  && !redmineProduct.getValue().equals("")
-              ? redmineProduct.getValue()
+          StringUtils.isNotEmpty(redmineCustomFieldsMap.get(redmineIssueProduct))
+              ? redmineCustomFieldsMap.get(redmineIssueProduct)
               : redmineIssueProductDefault;
 
       if (value != null) {
@@ -313,11 +320,11 @@ public class RedmineImportIssueServiceImpl extends RedmineImportService
         }
       } finally {
         if (++i % AbstractBatch.FETCH_LIMIT == 0) {
-          JPA.em().getTransaction().commit();
-
           if (!JPA.em().getTransaction().isActive()) {
             JPA.em().getTransaction().begin();
           }
+
+          JPA.em().getTransaction().commit();
 
           JPA.clear();
 
@@ -349,6 +356,8 @@ public class RedmineImportIssueServiceImpl extends RedmineImportService
     this.setTeamTaskFields(teamTask, redmineIssue);
 
     try {
+
+      batch = Beans.get(BatchRepository.class).find(batch.getId());
 
       if (teamTask.getId() == null) {
         teamTask.addCreatedBatchSetItem(batch);
@@ -429,28 +438,24 @@ public class RedmineImportIssueServiceImpl extends RedmineImportService
       Version targetVersion = redmineIssue.getTargetVersion();
       teamTask.setFixedVersion(targetVersion != null ? targetVersion.getName() : null);
 
-      CustomField customField = redmineIssue.getCustomFieldByName(redmineIssueDueDate);
-      String value = customField != null ? customField.getValue() : null;
+      String value = redmineCustomFieldsMap.get(redmineIssueDueDate);
       teamTask.setDueDate(
           value != null && !value.equals("") ? LocalDate.parse(value) : redmineIssueDueDateDefault);
 
-      customField = redmineIssue.getCustomFieldByName(redmineIssueEstimatedTime);
-      value = customField != null ? customField.getValue() : null;
+      value = redmineCustomFieldsMap.get(redmineIssueEstimatedTime);
       teamTask.setEstimatedTime(
           value != null && !value.equals("")
               ? new BigDecimal(value)
               : redmineIssueEstimatedTimeDefault);
 
-      customField = redmineIssue.getCustomFieldByName(redmineIssueInvoiced);
-      value = customField != null ? customField.getValue() : null;
+      value = redmineCustomFieldsMap.get(redmineIssueInvoiced);
 
       if (!teamTask.getInvoiced()) {
         teamTask.setInvoiced(value != null ? (value.equals("1") ? true : false) : false);
 
         teamTask.setProduct(product);
 
-        customField = redmineIssue.getCustomFieldByName(redmineIssueUnitPrice);
-        value = customField != null ? customField.getValue() : null;
+        value = redmineCustomFieldsMap.get(redmineIssueUnitPrice);
         teamTask.setUnitPrice(
             value != null && !value.equals("")
                 ? new BigDecimal(value)
@@ -463,18 +468,15 @@ public class RedmineImportIssueServiceImpl extends RedmineImportService
         teamTask.setCurrency(null);
       }
 
-      customField = redmineIssue.getCustomFieldByName(redmineIssueAccountedForMaintenance);
-      value = customField != null ? customField.getValue() : null;
+      value = redmineCustomFieldsMap.get(redmineIssueAccountedForMaintenance);
 
       teamTask.setAccountedForMaintenance(
           value != null ? (value.equals("1") ? true : false) : false);
 
-      customField = redmineIssue.getCustomFieldByName(redmineIssueIsOffered);
-      value = customField != null ? customField.getValue() : null;
+      value = redmineCustomFieldsMap.get(redmineIssueIsOffered);
       teamTask.setIsOffered(value != null ? (value.equals("1") ? true : false) : false);
 
-      customField = redmineIssue.getCustomFieldByName(redmineIssueIsTaskAccepted);
-      value = customField != null ? customField.getValue() : null;
+      value = redmineCustomFieldsMap.get(redmineIssueIsTaskAccepted);
       teamTask.setIsTaskAccepted(value != null ? (value.equals("1") ? true : false) : false);
 
       // ERROR AND IMPORT WITH DEFAULT IF STATUS NOT FOUND
@@ -517,6 +519,41 @@ public class RedmineImportIssueServiceImpl extends RedmineImportService
       setLocalDateTime(teamTask, redmineIssue.getCreatedOn(), "setCreatedOn");
     } catch (Exception e) {
       TraceBackService.trace(e, "", batch.getId());
+    }
+  }
+
+  private void executeImportInThread(List<Issue> redmineIssueList, RedmineBatch redmineBatch) {
+    String name = "test-thread-job";
+    Thread thread = new Thread(() -> executeInThreadedRequestScope(redmineIssueList, redmineBatch));
+    thread.setUncaughtExceptionHandler(
+        (t, e) -> {
+          final Throwable cause =
+              e instanceof UncheckedJobExecutionException && e.getCause() != null
+                  ? e.getCause()
+                  : e;
+          LOG.error(cause.getMessage(), cause);
+          TraceBackService.trace(cause);
+        });
+    long startTime = System.currentTimeMillis();
+
+    try {
+      thread.start();
+      thread.join();
+    } catch (InterruptedException e) {
+      TraceBackService.trace(e);
+      Thread.currentThread().interrupt();
+    } finally {
+      float duration = (System.currentTimeMillis() - startTime) / 1000f;
+      LOG.info("Job {} duration: {} s", name, duration);
+      JPA.clear();
+    }
+  }
+
+  private void executeInThreadedRequestScope(
+      List<Issue> redmineIssueList, RedmineBatch redmineBatch) {
+    RequestScoper scope = ServletScopes.scopeRequest(Collections.emptyMap());
+    try (RequestScoper.CloseableScope ignored = scope.open()) {
+      this.importIssuesFromList(redmineIssueList, redmineBatch);
     }
   }
 }

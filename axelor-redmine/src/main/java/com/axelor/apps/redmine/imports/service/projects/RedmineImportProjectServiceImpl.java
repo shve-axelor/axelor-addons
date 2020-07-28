@@ -21,9 +21,11 @@ import com.axelor.apps.base.db.AppRedmine;
 import com.axelor.apps.base.db.Batch;
 import com.axelor.apps.base.db.Partner;
 import com.axelor.apps.base.db.repo.AppRedmineRepository;
+import com.axelor.apps.base.db.repo.BatchRepository;
 import com.axelor.apps.base.db.repo.CompanyRepository;
 import com.axelor.apps.base.db.repo.PartnerRepository;
 import com.axelor.apps.base.db.repo.ProductRepository;
+import com.axelor.apps.base.job.UncheckedJobExecutionException;
 import com.axelor.apps.base.service.administration.AbstractBatch;
 import com.axelor.apps.project.db.Project;
 import com.axelor.apps.project.db.TeamTaskCategory;
@@ -38,18 +40,21 @@ import com.axelor.auth.db.repo.UserRepository;
 import com.axelor.db.JPA;
 import com.axelor.exception.service.TraceBackService;
 import com.axelor.i18n.I18n;
+import com.axelor.inject.Beans;
 import com.axelor.team.db.repo.TeamTaskRepository;
 import com.google.common.collect.ObjectArrays;
 import com.google.inject.Inject;
 import com.google.inject.persist.Transactional;
+import com.google.inject.servlet.RequestScoper;
+import com.google.inject.servlet.ServletScopes;
 import com.taskadapter.redmineapi.ProjectManager;
 import com.taskadapter.redmineapi.RedmineException;
-import com.taskadapter.redmineapi.bean.CustomField;
 import com.taskadapter.redmineapi.bean.Membership;
 import com.taskadapter.redmineapi.bean.Tracker;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -133,7 +138,7 @@ public class RedmineImportProjectServiceImpl extends RedmineImportService
         fieldMap.put(redmineImportMapping.getRedmineValue(), redmineImportMapping.getOsValue());
       }
 
-      this.importProjectsFromList(redmineProjectList);
+      this.executeImportInThread(redmineProjectList);
 
       // SET PROJECTS PARENTS
       this.setParentProjects();
@@ -186,11 +191,11 @@ public class RedmineImportProjectServiceImpl extends RedmineImportService
         }
       } finally {
         if (++i % AbstractBatch.FETCH_LIMIT == 0) {
-          JPA.em().getTransaction().commit();
-
           if (!JPA.em().getTransaction().isActive()) {
             JPA.em().getTransaction().begin();
           }
+
+          JPA.em().getTransaction().commit();
 
           JPA.clear();
 
@@ -225,6 +230,8 @@ public class RedmineImportProjectServiceImpl extends RedmineImportService
     this.setProjectFields(redmineProject, project);
 
     try {
+
+      batch = Beans.get(BatchRepository.class).find(batch.getId());
 
       if (project.getId() == null) {
         project.addCreatedBatchSetItem(batch);
@@ -276,24 +283,21 @@ public class RedmineImportProjectServiceImpl extends RedmineImportService
     project.setDescription(getHtmlFromTextile(redmineProject.getDescription()));
     project.setCompany(companyRepo.find(defaultCompanyId));
 
-    CustomField customField = (CustomField) redmineCustomFieldsMap.get(redmineProjectInvoiceable);
-    String value = customField != null ? customField.getValue() : null;
+    String value = redmineCustomFieldsMap.get(redmineProjectInvoiceable);
 
     boolean invoiceable = value != null ? (value.equals("1") ? true : false) : false;
     project.setToInvoice(invoiceable);
     project.setIsBusinessProject(invoiceable);
 
-    customField = (CustomField) redmineCustomFieldsMap.get(redmineProjectAssignedTo);
-    value = customField != null ? customField.getValue() : null;
+    value = redmineCustomFieldsMap.get(redmineProjectAssignedTo);
     project.setAssignedTo(
         StringUtils.isNotEmpty(value) ? getOsUser(Integer.parseInt(value)) : null);
 
     // ERROR AND IMPORT IF CLIENT PARTNER NOT FOUND
 
-    customField = (CustomField) redmineCustomFieldsMap.get(redmineProjectClientPartner);
     value =
-        customField != null && customField.getValue() != null && !customField.getValue().equals("")
-            ? customField.getValue()
+        StringUtils.isNotEmpty(redmineCustomFieldsMap.get(redmineProjectClientPartner))
+            ? redmineCustomFieldsMap.get(redmineProjectClientPartner)
             : redmineProjectClientPartnerDefault;
 
     if (value != null) {
@@ -363,10 +367,9 @@ public class RedmineImportProjectServiceImpl extends RedmineImportService
 
     // ERROR AND IMPORT IF INVOICING TYPE NOT FOUND
 
-    customField = (CustomField) redmineCustomFieldsMap.get(redmineProjectInvoicingSequenceSelect);
     value =
-        customField != null && customField.getValue() != null && !customField.getValue().equals("")
-            ? customField.getValue()
+        StringUtils.isNotEmpty(redmineCustomFieldsMap.get(redmineProjectInvoicingSequenceSelect))
+            ? redmineCustomFieldsMap.get(redmineProjectInvoicingSequenceSelect)
             : redmineProjectInvoicingSequenceSelectDefault;
 
     if (value != null) {
@@ -395,5 +398,41 @@ public class RedmineImportProjectServiceImpl extends RedmineImportService
     }
 
     setLocalDateTime(project, redmineProject.getCreatedOn(), "setCreatedOn");
+  }
+
+  private void executeImportInThread(
+      List<com.taskadapter.redmineapi.bean.Project> redmineProjectList) {
+    String name = "test-thread-job";
+    Thread thread = new Thread(() -> executeInThreadedRequestScope(redmineProjectList));
+    thread.setUncaughtExceptionHandler(
+        (t, e) -> {
+          final Throwable cause =
+              e instanceof UncheckedJobExecutionException && e.getCause() != null
+                  ? e.getCause()
+                  : e;
+          LOG.error(cause.getMessage(), cause);
+          TraceBackService.trace(cause);
+        });
+    long startTime = System.currentTimeMillis();
+
+    try {
+      thread.start();
+      thread.join();
+    } catch (InterruptedException e) {
+      TraceBackService.trace(e);
+      Thread.currentThread().interrupt();
+    } finally {
+      float duration = (System.currentTimeMillis() - startTime) / 1000f;
+      LOG.info("Job {} duration: {} s", name, duration);
+      JPA.clear();
+    }
+  }
+
+  private void executeInThreadedRequestScope(
+      List<com.taskadapter.redmineapi.bean.Project> redmineProjectList) {
+    RequestScoper scope = ServletScopes.scopeRequest(Collections.emptyMap());
+    try (RequestScoper.CloseableScope ignored = scope.open()) {
+      this.importProjectsFromList(redmineProjectList);
+    }
   }
 }

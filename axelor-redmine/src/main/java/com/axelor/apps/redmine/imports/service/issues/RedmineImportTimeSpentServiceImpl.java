@@ -26,6 +26,7 @@ import com.axelor.apps.base.db.repo.CompanyRepository;
 import com.axelor.apps.base.db.repo.PartnerRepository;
 import com.axelor.apps.base.db.repo.ProductRepository;
 import com.axelor.apps.base.db.repo.UnitRepository;
+import com.axelor.apps.base.job.UncheckedJobExecutionException;
 import com.axelor.apps.base.service.administration.AbstractBatch;
 import com.axelor.apps.base.service.app.AppBaseService;
 import com.axelor.apps.hr.db.Timesheet;
@@ -53,7 +54,8 @@ import com.axelor.team.db.repo.TeamTaskRepository;
 import com.google.common.collect.ObjectArrays;
 import com.google.inject.Inject;
 import com.google.inject.persist.Transactional;
-import com.taskadapter.redmineapi.bean.CustomField;
+import com.google.inject.servlet.RequestScoper;
+import com.google.inject.servlet.ServletScopes;
 import com.taskadapter.redmineapi.bean.TimeEntry;
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -68,6 +70,7 @@ import java.util.Locale;
 import java.util.ResourceBundle;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -116,10 +119,10 @@ public class RedmineImportTimeSpentServiceImpl extends RedmineImportService
   }
 
   Logger LOG = LoggerFactory.getLogger(getClass());
-  protected Long projectId = (long) 0;
-  protected Long teamTaskId = (long) 0;
-  protected Long userId = (long) 0;
-  protected Long productId = (long) 0;
+  protected Project project;
+  protected TeamTask teamTask;
+  protected User user;
+  protected Product product;
   protected String unitHoursName = null;
   protected Long defaultCompanyId;
   protected String redmineTimeSpentProductDefault;
@@ -179,170 +182,7 @@ public class RedmineImportTimeSpentServiceImpl extends RedmineImportService
       RedmineBatch redmineBatch = batch.getRedmineBatch();
       redmineBatch.setFailedRedmineTimeEntriesIds(null);
 
-      int i = 0;
-
-      for (TimeEntry redmineTimeEntry : redmineTimeEntryList) {
-        LOG.debug("Importing time entry: " + redmineTimeEntry.getId());
-
-        errors = new Object[] {};
-        String failedRedmineTimeEntriesIds = redmineBatch.getFailedRedmineTimeEntriesIds();
-
-        // ERROR AND DON'T IMPORT IF USER NOT FOUND
-
-        User user = getOsUser(redmineTimeEntry.getUserId());
-
-        if (user != null) {
-          this.userId = user.getId();
-        } else {
-          errors =
-              errors.length == 0
-                  ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_USER_NOT_FOUND)}
-                  : ObjectArrays.concat(
-                      errors,
-                      new Object[] {I18n.get(IMessage.REDMINE_IMPORT_USER_NOT_FOUND)},
-                      Object.class);
-
-          redmineBatch.setFailedRedmineTimeEntriesIds(
-              failedRedmineTimeEntriesIds == null
-                  ? redmineTimeEntry.getId().toString()
-                  : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
-
-          setErrorLog(
-              I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
-              redmineTimeEntry.getId().toString());
-
-          fail++;
-          continue;
-        }
-
-        // ERROR AND DON'T IMPORT IF PROJECT NOT FOUND
-
-        Project project = projectRepo.findByRedmineId(redmineTimeEntry.getProjectId());
-
-        if (project != null) {
-          this.projectId = project.getId();
-        } else {
-          errors =
-              errors.length == 0
-                  ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PROJECT_NOT_FOUND)}
-                  : ObjectArrays.concat(
-                      errors,
-                      new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PROJECT_NOT_FOUND)},
-                      Object.class);
-
-          redmineBatch.setFailedRedmineTimeEntriesIds(
-              failedRedmineTimeEntriesIds == null
-                  ? redmineTimeEntry.getId().toString()
-                  : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
-
-          setErrorLog(
-              I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
-              redmineTimeEntry.getId().toString());
-
-          fail++;
-          continue;
-        }
-
-        // ERROR AND DON'T IMPORT IF TEAMTASK NOT FOUND
-
-        Integer issueId = redmineTimeEntry.getIssueId();
-
-        if (issueId != null) {
-          TeamTask teamTask = teamTaskRepo.findByRedmineId(issueId);
-
-          if (teamTask != null) {
-            this.teamTaskId = teamTask.getId();
-          } else {
-            errors =
-                errors.length == 0
-                    ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_TEAM_TASK_NOT_FOUND)}
-                    : ObjectArrays.concat(
-                        errors,
-                        new Object[] {I18n.get(IMessage.REDMINE_IMPORT_TEAM_TASK_NOT_FOUND)},
-                        Object.class);
-
-            redmineBatch.setFailedRedmineTimeEntriesIds(
-                failedRedmineTimeEntriesIds == null
-                    ? redmineTimeEntry.getId().toString()
-                    : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
-
-            setErrorLog(
-                I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
-                redmineTimeEntry.getId().toString());
-
-            fail++;
-            continue;
-          }
-        } else {
-          this.teamTaskId = (long) 0;
-        }
-
-        // ERROR AND DON'T IMPORT IF PRODUCT IS SELECTED IN REDMINE AND NOT FOUND IN OS
-
-        CustomField redmineProduct = redmineTimeEntry.getCustomField(redmineTimeSpentProduct);
-        String value =
-            redmineProduct != null
-                    && redmineProduct.getValue() != null
-                    && !redmineProduct.getValue().equals("")
-                ? redmineProduct.getValue()
-                : (user.getEmployee() != null && user.getEmployee().getProduct() != null
-                    ? user.getEmployee().getProduct().getCode()
-                    : redmineTimeSpentProductDefault);
-
-        if (value != null) {
-          Product product = productRepo.findByCode(value);
-
-          if (product == null) {
-            errors =
-                errors.length == 0
-                    ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PRODUCT_NOT_FOUND)}
-                    : ObjectArrays.concat(
-                        errors,
-                        new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PRODUCT_NOT_FOUND)},
-                        Object.class);
-
-            redmineBatch.setFailedRedmineTimeEntriesIds(
-                failedRedmineTimeEntriesIds == null
-                    ? redmineTimeEntry.getId().toString()
-                    : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
-
-            setErrorLog(
-                I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
-                redmineTimeEntry.getId().toString());
-
-            fail++;
-            continue;
-          }
-
-          this.productId = product.getId();
-        } else {
-          this.productId = (long) 0;
-        }
-
-        try {
-          this.createOpenSuiteTimesheetLine(redmineTimeEntry);
-
-          if (errors.length > 0) {
-            setErrorLog(
-                I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
-                redmineTimeEntry.getId().toString());
-          }
-        } finally {
-          if (++i % AbstractBatch.FETCH_LIMIT == 0) {
-            JPA.em().getTransaction().commit();
-
-            if (!JPA.em().getTransaction().isActive()) {
-              JPA.em().getTransaction().begin();
-            }
-
-            JPA.clear();
-
-            if (!JPA.em().contains(batch)) {
-              batch = JPA.find(Batch.class, batch.getId());
-            }
-          }
-        }
-      }
+      this.executeImportInThread(redmineTimeEntryList, redmineBatch);
 
       if (!updatedOnMap.isEmpty()) {
         String values =
@@ -373,6 +213,166 @@ public class RedmineImportTimeSpentServiceImpl extends RedmineImportService
     result += String.format("%s \n", resultStr);
     LOG.debug(resultStr);
     success = fail = 0;
+  }
+
+  public void importTimeSpentFromList(
+      List<TimeEntry> redmineTimeEntryList, RedmineBatch redmineBatch) {
+
+    int i = 0;
+
+    for (TimeEntry redmineTimeEntry : redmineTimeEntryList) {
+      LOG.debug("Importing time entry: " + redmineTimeEntry.getId());
+
+      errors = new Object[] {};
+      String failedRedmineTimeEntriesIds = redmineBatch.getFailedRedmineTimeEntriesIds();
+
+      setRedmineCustomFieldsMap(redmineTimeEntry.getCustomFields());
+
+      // ERROR AND DON'T IMPORT IF USER NOT FOUND
+
+      user = getOsUser(redmineTimeEntry.getUserId());
+
+      if (user == null) {
+        errors =
+            errors.length == 0
+                ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_USER_NOT_FOUND)}
+                : ObjectArrays.concat(
+                    errors,
+                    new Object[] {I18n.get(IMessage.REDMINE_IMPORT_USER_NOT_FOUND)},
+                    Object.class);
+
+        redmineBatch.setFailedRedmineTimeEntriesIds(
+            failedRedmineTimeEntriesIds == null
+                ? redmineTimeEntry.getId().toString()
+                : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
+
+        setErrorLog(
+            I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
+            redmineTimeEntry.getId().toString());
+
+        fail++;
+        continue;
+      }
+
+      // ERROR AND DON'T IMPORT IF PROJECT NOT FOUND
+
+      project = projectRepo.findByRedmineId(redmineTimeEntry.getProjectId());
+
+      if (project == null) {
+        errors =
+            errors.length == 0
+                ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PROJECT_NOT_FOUND)}
+                : ObjectArrays.concat(
+                    errors,
+                    new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PROJECT_NOT_FOUND)},
+                    Object.class);
+
+        redmineBatch.setFailedRedmineTimeEntriesIds(
+            failedRedmineTimeEntriesIds == null
+                ? redmineTimeEntry.getId().toString()
+                : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
+
+        setErrorLog(
+            I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
+            redmineTimeEntry.getId().toString());
+
+        fail++;
+        continue;
+      }
+
+      // ERROR AND DON'T IMPORT IF TEAMTASK NOT FOUND
+
+      Integer issueId = redmineTimeEntry.getIssueId();
+
+      if (issueId != null) {
+        teamTask = teamTaskRepo.findByRedmineId(issueId);
+
+        if (teamTask == null) {
+          errors =
+              errors.length == 0
+                  ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_TEAM_TASK_NOT_FOUND)}
+                  : ObjectArrays.concat(
+                      errors,
+                      new Object[] {I18n.get(IMessage.REDMINE_IMPORT_TEAM_TASK_NOT_FOUND)},
+                      Object.class);
+
+          redmineBatch.setFailedRedmineTimeEntriesIds(
+              failedRedmineTimeEntriesIds == null
+                  ? redmineTimeEntry.getId().toString()
+                  : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
+
+          setErrorLog(
+              I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
+              redmineTimeEntry.getId().toString());
+
+          fail++;
+          continue;
+        }
+      } else {
+        teamTask = null;
+      }
+
+      // ERROR AND DON'T IMPORT IF PRODUCT IS SELECTED IN REDMINE AND NOT FOUND IN OS
+
+      String value =
+          StringUtils.isNotEmpty(redmineCustomFieldsMap.get(redmineTimeSpentProduct))
+              ? redmineCustomFieldsMap.get(redmineTimeSpentProduct)
+              : (user.getEmployee() != null && user.getEmployee().getProduct() != null
+                  ? user.getEmployee().getProduct().getCode()
+                  : redmineTimeSpentProductDefault);
+
+      if (value != null) {
+        product = productRepo.findByCode(value);
+
+        if (product == null) {
+          errors =
+              errors.length == 0
+                  ? new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PRODUCT_NOT_FOUND)}
+                  : ObjectArrays.concat(
+                      errors,
+                      new Object[] {I18n.get(IMessage.REDMINE_IMPORT_PRODUCT_NOT_FOUND)},
+                      Object.class);
+
+          redmineBatch.setFailedRedmineTimeEntriesIds(
+              failedRedmineTimeEntriesIds == null
+                  ? redmineTimeEntry.getId().toString()
+                  : failedRedmineTimeEntriesIds + "," + redmineTimeEntry.getId().toString());
+
+          setErrorLog(
+              I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
+              redmineTimeEntry.getId().toString());
+
+          fail++;
+          continue;
+        }
+      } else {
+        product = null;
+      }
+
+      try {
+        this.createOpenSuiteTimesheetLine(redmineTimeEntry);
+
+        if (errors.length > 0) {
+          setErrorLog(
+              I18n.get(IMessage.REDMINE_IMPORT_TIMESHEET_LINE_ERROR),
+              redmineTimeEntry.getId().toString());
+        }
+      } finally {
+        if (++i % AbstractBatch.FETCH_LIMIT == 0) {
+          JPA.em().getTransaction().commit();
+
+          if (!JPA.em().getTransaction().isActive()) {
+            JPA.em().getTransaction().begin();
+          }
+
+          JPA.clear();
+
+          if (!JPA.em().contains(batch)) {
+            batch = JPA.find(Batch.class, batch.getId());
+          }
+        }
+      }
+    }
   }
 
   @Transactional
@@ -423,14 +423,12 @@ public class RedmineImportTimeSpentServiceImpl extends RedmineImportService
   @Transactional
   public void setTimesheetLineFields(TimesheetLine timesheetLine, TimeEntry redmineTimeEntry) {
 
-    User user = userRepo.find(userId);
-
     timesheetLine.setUser(user);
     timesheetLine.setRedmineId(redmineTimeEntry.getId());
-    timesheetLine.setProject(projectRepo.find(projectId));
-    timesheetLine.setTeamTask(teamTaskRepo.find(teamTaskId));
+    timesheetLine.setProject(project);
+    timesheetLine.setTeamTask(teamTask);
 
-    timesheetLine.setProduct(productRepo.find(productId));
+    timesheetLine.setProduct(product);
     timesheetLine.setComments(redmineTimeEntry.getComment());
 
     BigDecimal duration = BigDecimal.valueOf(redmineTimeEntry.getHours());
@@ -439,13 +437,11 @@ public class RedmineImportTimeSpentServiceImpl extends RedmineImportService
     timesheetLine.setDate(
         redmineTimeEntry.getSpentOn().toInstant().atZone(ZoneId.systemDefault()).toLocalDate());
 
-    CustomField customField = redmineTimeEntry.getCustomField(redmineTimeSpentDurationForCustomer);
-    String value = customField != null ? customField.getValue() : null;
+    String value = redmineCustomFieldsMap.get(redmineTimeSpentDurationForCustomer);
     timesheetLine.setDurationForCustomer(
         value != null && !value.equals("") ? new BigDecimal(value) : duration);
 
-    customField = redmineTimeEntry.getCustomField(redmineTimeSpentDurationUnit);
-    value = customField != null ? customField.getValue() : null;
+    value = redmineCustomFieldsMap.get(redmineTimeSpentDurationUnit);
 
     Unit unit = null;
 
@@ -508,5 +504,42 @@ public class RedmineImportTimeSpentServiceImpl extends RedmineImportService
 
     setCreatedByUser(timesheetLine, user, "setCreatedBy");
     setLocalDateTime(timesheetLine, redmineTimeEntry.getCreatedOn(), "setCreatedOn");
+  }
+
+  private void executeImportInThread(
+      List<TimeEntry> redmineTimeEntryList, RedmineBatch redmineBatch) {
+    String name = "test-thread-job";
+    Thread thread =
+        new Thread(() -> executeInThreadedRequestScope(redmineTimeEntryList, redmineBatch));
+    thread.setUncaughtExceptionHandler(
+        (t, e) -> {
+          final Throwable cause =
+              e instanceof UncheckedJobExecutionException && e.getCause() != null
+                  ? e.getCause()
+                  : e;
+          LOG.error(cause.getMessage(), cause);
+          TraceBackService.trace(cause);
+        });
+    long startTime = System.currentTimeMillis();
+
+    try {
+      thread.start();
+      thread.join();
+    } catch (InterruptedException e) {
+      TraceBackService.trace(e);
+      Thread.currentThread().interrupt();
+    } finally {
+      float duration = (System.currentTimeMillis() - startTime) / 1000f;
+      LOG.info("Job {} duration: {} s", name, duration);
+      JPA.clear();
+    }
+  }
+
+  private void executeInThreadedRequestScope(
+      List<TimeEntry> redmineTimeEntryList, RedmineBatch redmineBatch) {
+    RequestScoper scope = ServletScopes.scopeRequest(Collections.emptyMap());
+    try (RequestScoper.CloseableScope ignored = scope.open()) {
+      this.importTimeSpentFromList(redmineTimeEntryList, redmineBatch);
+    }
   }
 }
